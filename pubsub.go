@@ -277,8 +277,16 @@ func (p *PubSub) processLoop(ctx context.Context) {
 	defer p.cleanup()
 
 	workLeft := make(chan bool)
+	// Similar to a "saga": run through events, but hands off control via workLeft.
+	go func() {
+		for {
+			if exit := p.processNextEvent(ctx, workLeft); exit {
+				return
+			}
+		}
+	}()
+	// Keep draining work signals until there is no work left.
 	for {
-		p.processNextEvent(ctx, workLeft)
 		if work := <-workLeft; !work {
 			// no work left, ending event loop!
 			close(workLeft)
@@ -296,7 +304,9 @@ func (p *PubSub) processLoop(ctx context.Context) {
 //
 // The caller may detect from another go routine that there is temporarily no work queued,
 // and ensure that it can reliably create new events (e.g. large scale in-sync model simulations).
-func (p *PubSub) processNextEvent(ctx context.Context, workLeft chan<- bool) {
+//
+// Returns true if exiting, to stop the event loop without knowledge of workLeft.
+func (p *PubSub) processNextEvent(ctx context.Context, workLeft chan<- bool) (exit bool) {
 		select {
 		case pid := <-p.newPeers:
 			workLeft <- true
@@ -444,8 +454,9 @@ func (p *PubSub) processNextEvent(ctx context.Context, workLeft chan<- bool) {
 		case <-ctx.Done():
 			workLeft <- false
 			log.Info("pubsub processloop shutting down")
-			return
+			return true
 		}
+	return
 }
 
 // handleRemoveSubscription removes Subscription sub from bookeeping.
