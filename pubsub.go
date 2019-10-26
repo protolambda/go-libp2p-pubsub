@@ -307,68 +307,140 @@ func (p *PubSub) processLoop(ctx context.Context) {
 //
 // Returns true if exiting, to stop the event loop without knowledge of workLeft.
 func (p *PubSub) processNextEvent(ctx context.Context, workLeft chan<- bool) (exit bool) {
-		select {
-		case pid := <-p.newPeers:
-			workLeft <- true
-			if _, ok := p.peers[pid]; ok {
-				log.Warning("already have connection to peer: ", pid)
-				return
-			}
+	select {
+	case pid := <-p.newPeers:
+		workLeft <- true
+		if _, ok := p.peers[pid]; ok {
+			log.Warning("already have connection to peer: ", pid)
+			return
+		}
 
-			if p.blacklist.Contains(pid) {
-				log.Warning("ignoring connection from blacklisted peer: ", pid)
-				return
-			}
+		if p.blacklist.Contains(pid) {
+			log.Warning("ignoring connection from blacklisted peer: ", pid)
+			return
+		}
 
+		messages := make(chan *RPC, 32)
+		messages <- p.getHelloPacket()
+		go p.handleNewPeer(ctx, pid, messages)
+		p.peers[pid] = messages
+
+	case s := <-p.newPeerStream:
+		workLeft <- true
+		pid := s.Conn().RemotePeer()
+
+		ch, ok := p.peers[pid]
+		if !ok {
+			log.Warning("new stream for unknown peer: ", pid)
+			s.Reset()
+			return
+		}
+
+		if p.blacklist.Contains(pid) {
+			log.Warning("closing stream for blacklisted peer: ", pid)
+			close(ch)
+			s.Reset()
+			return
+		}
+
+		p.rt.AddPeer(pid, s.Protocol())
+
+	case pid := <-p.newPeerError:
+		workLeft <- true
+		delete(p.peers, pid)
+
+	case pid := <-p.peerDead:
+		workLeft <- true
+		ch, ok := p.peers[pid]
+		if !ok {
+			return
+		}
+
+		close(ch)
+
+		if p.host.Network().Connectedness(pid) == network.Connected {
+			// still connected, must be a duplicate connection being closed.
+			// we respawn the writer as we need to ensure there is a stream active
+			log.Warning("peer declared dead but still connected; respawning writer: ", pid)
 			messages := make(chan *RPC, 32)
 			messages <- p.getHelloPacket()
 			go p.handleNewPeer(ctx, pid, messages)
 			p.peers[pid] = messages
+			return
+		}
 
-		case s := <-p.newPeerStream:
-			workLeft <- true
-			pid := s.Conn().RemotePeer()
-
-			ch, ok := p.peers[pid]
-			if !ok {
-				log.Warning("new stream for unknown peer: ", pid)
-				s.Reset()
-				return
+		delete(p.peers, pid)
+		for t, tmap := range p.topics {
+			if _, ok := tmap[pid]; ok {
+				delete(tmap, pid)
+				p.notifyLeave(t, pid)
 			}
+		}
 
-			if p.blacklist.Contains(pid) {
-				log.Warning("closing stream for blacklisted peer: ", pid)
-				close(ch)
-				s.Reset()
-				return
+		p.rt.RemovePeer(pid)
+
+	case treq := <-p.getTopics:
+		workLeft <- true
+		var out []string
+		for t := range p.myTopics {
+			out = append(out, t)
+		}
+		treq.resp <- out
+	case sub := <-p.cancelCh:
+		workLeft <- true
+		p.handleRemoveSubscription(sub)
+	case sub := <-p.addSub:
+		workLeft <- true
+		p.handleAddSubscription(sub)
+	case preq := <-p.getPeers:
+		workLeft <- true
+		tmap, ok := p.topics[preq.topic]
+		if preq.topic != "" && !ok {
+			preq.resp <- nil
+			return
+		}
+		var peers []peer.ID
+		for p := range p.peers {
+			if preq.topic != "" {
+				_, ok := tmap[p]
+				if !ok {
+					continue
+				}
 			}
+			peers = append(peers, p)
+		}
+		preq.resp <- peers
+	case rpc := <-p.incoming:
+		workLeft <- true
+		p.handleIncomingRPC(rpc)
 
-			p.rt.AddPeer(pid, s.Protocol())
+	case msg := <-p.publish:
+		p.pushMsg(msg)
 
-		case pid := <-p.newPeerError:
-			workLeft <- true
-			delete(p.peers, pid)
+	case msg := <-p.sendMsg:
+		workLeft <- true
+		p.publishMessage(msg)
 
-		case pid := <-p.peerDead:
-			workLeft <- true
-			ch, ok := p.peers[pid]
-			if !ok {
-				return
-			}
+	case req := <-p.addVal:
+		workLeft <- true
+		p.val.AddValidator(req)
 
+	case req := <-p.rmVal:
+		workLeft <- true
+		p.val.RemoveValidator(req)
+
+	case thunk := <-p.eval:
+		workLeft <- true
+		thunk()
+
+	case pid := <-p.blacklistPeer:
+		workLeft <- true
+		log.Infof("Blacklisting peer %s", pid)
+		p.blacklist.Add(pid)
+
+		ch, ok := p.peers[pid]
+		if ok {
 			close(ch)
-
-			if p.host.Network().Connectedness(pid) == network.Connected {
-				// still connected, must be a duplicate connection being closed.
-				// we respawn the writer as we need to ensure there is a stream active
-				log.Warning("peer declared dead but still connected; respawning writer: ", pid)
-				messages := make(chan *RPC, 32)
-				messages <- p.getHelloPacket()
-				go p.handleNewPeer(ctx, pid, messages)
-				p.peers[pid] = messages
-				return
-			}
-
 			delete(p.peers, pid)
 			for t, tmap := range p.topics {
 				if _, ok := tmap[pid]; ok {
@@ -376,86 +448,14 @@ func (p *PubSub) processNextEvent(ctx context.Context, workLeft chan<- bool) (ex
 					p.notifyLeave(t, pid)
 				}
 			}
-
 			p.rt.RemovePeer(pid)
-
-		case treq := <-p.getTopics:
-			workLeft <- true
-			var out []string
-			for t := range p.myTopics {
-				out = append(out, t)
-			}
-			treq.resp <- out
-		case sub := <-p.cancelCh:
-			workLeft <- true
-			p.handleRemoveSubscription(sub)
-		case sub := <-p.addSub:
-			workLeft <- true
-			p.handleAddSubscription(sub)
-		case preq := <-p.getPeers:
-			workLeft <- true
-			tmap, ok := p.topics[preq.topic]
-			if preq.topic != "" && !ok {
-				preq.resp <- nil
-				return
-			}
-			var peers []peer.ID
-			for p := range p.peers {
-				if preq.topic != "" {
-					_, ok := tmap[p]
-					if !ok {
-						continue
-					}
-				}
-				peers = append(peers, p)
-			}
-			preq.resp <- peers
-		case rpc := <-p.incoming:
-			workLeft <- true
-			p.handleIncomingRPC(rpc)
-
-		case msg := <-p.publish:
-			p.pushMsg(msg)
-
-		case msg := <-p.sendMsg:
-			workLeft <- true
-			p.publishMessage(msg)
-
-		case req := <-p.addVal:
-			workLeft <- true
-			p.val.AddValidator(req)
-
-		case req := <-p.rmVal:
-			workLeft <- true
-			p.val.RemoveValidator(req)
-
-		case thunk := <-p.eval:
-			workLeft <- true
-			thunk()
-
-		case pid := <-p.blacklistPeer:
-			workLeft <- true
-			log.Infof("Blacklisting peer %s", pid)
-			p.blacklist.Add(pid)
-
-			ch, ok := p.peers[pid]
-			if ok {
-				close(ch)
-				delete(p.peers, pid)
-				for t, tmap := range p.topics {
-					if _, ok := tmap[pid]; ok {
-						delete(tmap, pid)
-						p.notifyLeave(t, pid)
-					}
-				}
-				p.rt.RemovePeer(pid)
-			}
-
-		case <-ctx.Done():
-			workLeft <- false
-			log.Info("pubsub processloop shutting down")
-			return true
 		}
+
+	case <-ctx.Done():
+		workLeft <- false
+		log.Info("pubsub processloop shutting down")
+		return true
+	}
 	return
 }
 
