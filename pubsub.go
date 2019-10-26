@@ -42,6 +42,12 @@ type PubSub struct {
 
 	val *validation
 
+	// work left, fed into event controller
+	workLeft chan struct{}
+
+	// can block the event-loop by not reading from workLeft right away, and detect idling with a select-default.
+	eventControl func(workLeft <-chan struct{})
+
 	// incoming messages from other peers
 	incoming chan *RPC
 
@@ -161,6 +167,8 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		signID:        h.ID(),
 		signKey:       h.Peerstore().PrivKey(h.ID()),
 		signStrict:    true,
+		workLeft:      make(chan struct{}),
+		eventControl:  defaultEventControl,
 		incoming:      make(chan *RPC, 32),
 		publish:       make(chan *Message),
 		newPeers:      make(chan peer.ID),
@@ -204,6 +212,7 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 
 	ps.val.Start(ps)
 
+	go ps.eventControl(ps.workLeft)
 	go ps.processLoop(ctx)
 
 	return ps, nil
@@ -272,44 +281,49 @@ func (p *PubSub) cleanup() {
 	p.topics = nil
 }
 
+func WithEventControl(control func(workLeft <-chan struct{})) Option {
+	return func(p *PubSub) error {
+		p.eventControl = control
+		return nil
+	}
+}
+
+func defaultEventControl(workLeft <-chan struct{}) {
+	// Keep draining work signals until there is no work left.
+	for {
+		if _, ok := <-workLeft; !ok {
+			return
+		}
+	}
+}
+
 // processLoop handles all inputs arriving on the channels
 func (p *PubSub) processLoop(ctx context.Context) {
 	defer p.cleanup()
 
-	workLeft := make(chan bool)
 	// Similar to a "saga": run through events, but hands off control via workLeft.
-	go func() {
-		for {
-			if exit := p.processNextEvent(ctx, workLeft); exit {
-				return
-			}
-		}
-	}()
-	// Keep draining work signals until there is no work left.
 	for {
-		if work := <-workLeft; !work {
-			// no work left, ending event loop!
-			close(workLeft)
+		if exit := p.processNextEvent(ctx); exit {
 			return
 		}
 	}
 }
 
 // processNextEvent selects the next event (from the event channels) to be processed,
-// and shares that there is work left to do with a "true" message to workLeft.
+// and shares that there is work left to do with a message to workLeft.
 // It then blocks till the work is acknowledged, and executes the work.
 //
-// If the events are done, i.e. ctx.Done() is selected as event, no work is left and and a "false" is shared.
+// If the events are done, i.e. ctx.Done() is selected as event, no work is left and the workLeft channel is closed.
 // It is on the caller to stop processing events when no work is left to do.
 //
 // The caller may detect from another go routine that there is temporarily no work queued,
-// and ensure that it can reliably create new events (e.g. large scale in-sync model simulations).
+// and ensure that it can reliably create new events (e.g. for large scale in-sync model simulations).
 //
 // Returns true if exiting, to stop the event loop without knowledge of workLeft.
-func (p *PubSub) processNextEvent(ctx context.Context, workLeft chan<- bool) (exit bool) {
+func (p *PubSub) processNextEvent(ctx context.Context) (exit bool) {
 	select {
 	case pid := <-p.newPeers:
-		workLeft <- true
+		p.workLeft <- struct{}{}
 		if _, ok := p.peers[pid]; ok {
 			log.Warning("already have connection to peer: ", pid)
 			return
@@ -326,7 +340,7 @@ func (p *PubSub) processNextEvent(ctx context.Context, workLeft chan<- bool) (ex
 		p.peers[pid] = messages
 
 	case s := <-p.newPeerStream:
-		workLeft <- true
+		p.workLeft <- struct{}{}
 		pid := s.Conn().RemotePeer()
 
 		ch, ok := p.peers[pid]
@@ -346,11 +360,11 @@ func (p *PubSub) processNextEvent(ctx context.Context, workLeft chan<- bool) (ex
 		p.rt.AddPeer(pid, s.Protocol())
 
 	case pid := <-p.newPeerError:
-		workLeft <- true
+		p.workLeft <- struct{}{}
 		delete(p.peers, pid)
 
 	case pid := <-p.peerDead:
-		workLeft <- true
+		p.workLeft <- struct{}{}
 		ch, ok := p.peers[pid]
 		if !ok {
 			return
@@ -380,20 +394,20 @@ func (p *PubSub) processNextEvent(ctx context.Context, workLeft chan<- bool) (ex
 		p.rt.RemovePeer(pid)
 
 	case treq := <-p.getTopics:
-		workLeft <- true
+		p.workLeft <- struct{}{}
 		var out []string
 		for t := range p.myTopics {
 			out = append(out, t)
 		}
 		treq.resp <- out
 	case sub := <-p.cancelCh:
-		workLeft <- true
+		p.workLeft <- struct{}{}
 		p.handleRemoveSubscription(sub)
 	case sub := <-p.addSub:
-		workLeft <- true
+		p.workLeft <- struct{}{}
 		p.handleAddSubscription(sub)
 	case preq := <-p.getPeers:
-		workLeft <- true
+		p.workLeft <- struct{}{}
 		tmap, ok := p.topics[preq.topic]
 		if preq.topic != "" && !ok {
 			preq.resp <- nil
@@ -411,30 +425,30 @@ func (p *PubSub) processNextEvent(ctx context.Context, workLeft chan<- bool) (ex
 		}
 		preq.resp <- peers
 	case rpc := <-p.incoming:
-		workLeft <- true
+		p.workLeft <- struct{}{}
 		p.handleIncomingRPC(rpc)
 
 	case msg := <-p.publish:
 		p.pushMsg(msg)
 
 	case msg := <-p.sendMsg:
-		workLeft <- true
+		p.workLeft <- struct{}{}
 		p.publishMessage(msg)
 
 	case req := <-p.addVal:
-		workLeft <- true
+		p.workLeft <- struct{}{}
 		p.val.AddValidator(req)
 
 	case req := <-p.rmVal:
-		workLeft <- true
+		p.workLeft <- struct{}{}
 		p.val.RemoveValidator(req)
 
 	case thunk := <-p.eval:
-		workLeft <- true
+		p.workLeft <- struct{}{}
 		thunk()
 
 	case pid := <-p.blacklistPeer:
-		workLeft <- true
+		p.workLeft <- struct{}{}
 		log.Infof("Blacklisting peer %s", pid)
 		p.blacklist.Add(pid)
 
@@ -452,7 +466,7 @@ func (p *PubSub) processNextEvent(ctx context.Context, workLeft chan<- bool) (ex
 		}
 
 	case <-ctx.Done():
-		workLeft <- false
+		close(p.workLeft)
 		log.Info("pubsub processloop shutting down")
 		return true
 	}
