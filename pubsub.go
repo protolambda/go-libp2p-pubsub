@@ -263,28 +263,51 @@ func WithBlacklist(b Blacklist) Option {
 	}
 }
 
+func (p *PubSub) cleanup() {
+	// Clean up go routines.
+	for _, ch := range p.peers {
+		close(ch)
+	}
+	p.peers = nil
+	p.topics = nil
+}
+
 // processLoop handles all inputs arriving on the channels
 func (p *PubSub) processLoop(ctx context.Context) {
-	defer func() {
-		// Clean up go routines.
-		for _, ch := range p.peers {
-			close(ch)
-		}
-		p.peers = nil
-		p.topics = nil
-	}()
+	defer p.cleanup()
 
+	workLeft := make(chan bool)
 	for {
+		p.processNextEvent(ctx, workLeft)
+		if work := <-workLeft; !work {
+			// no work left, ending event loop!
+			close(workLeft)
+			return
+		}
+	}
+}
+
+// processNextEvent selects the next event (from the event channels) to be processed,
+// and shares that there is work left to do with a "true" message to workLeft.
+// It then blocks till the work is acknowledged, and executes the work.
+//
+// If the events are done, i.e. ctx.Done() is selected as event, no work is left and and a "false" is shared.
+// It is on the caller to stop processing events when no work is left to do.
+//
+// The caller may detect from another go routine that there is temporarily no work queued,
+// and ensure that it can reliably create new events (e.g. large scale in-sync model simulations).
+func (p *PubSub) processNextEvent(ctx context.Context, workLeft chan<- bool) {
 		select {
 		case pid := <-p.newPeers:
+			workLeft <- true
 			if _, ok := p.peers[pid]; ok {
 				log.Warning("already have connection to peer: ", pid)
-				continue
+				return
 			}
 
 			if p.blacklist.Contains(pid) {
 				log.Warning("ignoring connection from blacklisted peer: ", pid)
-				continue
+				return
 			}
 
 			messages := make(chan *RPC, 32)
@@ -293,31 +316,34 @@ func (p *PubSub) processLoop(ctx context.Context) {
 			p.peers[pid] = messages
 
 		case s := <-p.newPeerStream:
+			workLeft <- true
 			pid := s.Conn().RemotePeer()
 
 			ch, ok := p.peers[pid]
 			if !ok {
 				log.Warning("new stream for unknown peer: ", pid)
 				s.Reset()
-				continue
+				return
 			}
 
 			if p.blacklist.Contains(pid) {
 				log.Warning("closing stream for blacklisted peer: ", pid)
 				close(ch)
 				s.Reset()
-				continue
+				return
 			}
 
 			p.rt.AddPeer(pid, s.Protocol())
 
 		case pid := <-p.newPeerError:
+			workLeft <- true
 			delete(p.peers, pid)
 
 		case pid := <-p.peerDead:
+			workLeft <- true
 			ch, ok := p.peers[pid]
 			if !ok {
-				continue
+				return
 			}
 
 			close(ch)
@@ -330,7 +356,7 @@ func (p *PubSub) processLoop(ctx context.Context) {
 				messages <- p.getHelloPacket()
 				go p.handleNewPeer(ctx, pid, messages)
 				p.peers[pid] = messages
-				continue
+				return
 			}
 
 			delete(p.peers, pid)
@@ -344,20 +370,24 @@ func (p *PubSub) processLoop(ctx context.Context) {
 			p.rt.RemovePeer(pid)
 
 		case treq := <-p.getTopics:
+			workLeft <- true
 			var out []string
 			for t := range p.myTopics {
 				out = append(out, t)
 			}
 			treq.resp <- out
 		case sub := <-p.cancelCh:
+			workLeft <- true
 			p.handleRemoveSubscription(sub)
 		case sub := <-p.addSub:
+			workLeft <- true
 			p.handleAddSubscription(sub)
 		case preq := <-p.getPeers:
+			workLeft <- true
 			tmap, ok := p.topics[preq.topic]
 			if preq.topic != "" && !ok {
 				preq.resp <- nil
-				continue
+				return
 			}
 			var peers []peer.ID
 			for p := range p.peers {
@@ -371,24 +401,30 @@ func (p *PubSub) processLoop(ctx context.Context) {
 			}
 			preq.resp <- peers
 		case rpc := <-p.incoming:
+			workLeft <- true
 			p.handleIncomingRPC(rpc)
 
 		case msg := <-p.publish:
 			p.pushMsg(msg)
 
 		case msg := <-p.sendMsg:
+			workLeft <- true
 			p.publishMessage(msg)
 
 		case req := <-p.addVal:
+			workLeft <- true
 			p.val.AddValidator(req)
 
 		case req := <-p.rmVal:
+			workLeft <- true
 			p.val.RemoveValidator(req)
 
 		case thunk := <-p.eval:
+			workLeft <- true
 			thunk()
 
 		case pid := <-p.blacklistPeer:
+			workLeft <- true
 			log.Infof("Blacklisting peer %s", pid)
 			p.blacklist.Add(pid)
 
@@ -406,10 +442,10 @@ func (p *PubSub) processLoop(ctx context.Context) {
 			}
 
 		case <-ctx.Done():
+			workLeft <- false
 			log.Info("pubsub processloop shutting down")
 			return
 		}
-	}
 }
 
 // handleRemoveSubscription removes Subscription sub from bookeeping.
