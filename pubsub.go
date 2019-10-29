@@ -18,7 +18,6 @@ import (
 	"github.com/libp2p/go-libp2p-core/protocol"
 
 	logging "github.com/ipfs/go-log"
-	timecache "github.com/whyrusleeping/timecache"
 )
 
 var (
@@ -97,7 +96,7 @@ type PubSub struct {
 	peers map[peer.ID]chan *RPC
 
 	seenMessagesMx sync.Mutex
-	seenMessages   *timecache.TimeCache
+	seenMessages   *TimeCache
 
 	// key for signing messages; nil when signing is disabled (default for now)
 	signKey crypto.PrivKey
@@ -105,6 +104,8 @@ type PubSub struct {
 	signID peer.ID
 	// strict mode rejects all unsigned messages prior to validation
 	signStrict bool
+
+	clock NanoClock
 
 	ctx context.Context
 }
@@ -180,7 +181,7 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		peers:         make(map[peer.ID]chan *RPC),
 		blacklist:     NewMapBlacklist(),
 		blacklistPeer: make(chan peer.ID),
-		seenMessages:  timecache.NewTimeCache(TimeCacheDuration),
+		// any unique enough value, time is not relevant. Can be customized with WithInitialSeqNo
 		counter:       uint64(time.Now().UnixNano()),
 	}
 
@@ -190,6 +191,8 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 			return nil, err
 		}
 	}
+
+	ps.seenMessages = NewTimeCache(ps.clock, TimeCacheDuration)
 
 	if ps.signStrict && ps.signKey == nil {
 		return nil, fmt.Errorf("strict signature verification enabled but message signing is disabled")
@@ -212,6 +215,20 @@ func (ps *PubSub) Start(runEventLoop bool) {
 
 	if runEventLoop {
 		go ps.processLoop()
+	}
+}
+
+func WithInitialSeqNo(v uint64) Option {
+	return func(p *PubSub) error {
+		p.counter = v
+		return nil
+	}
+}
+
+func WithClock(clock NanoClock) Option {
+	return func(p *PubSub) error {
+		p.clock = clock
+		return nil
 	}
 }
 
@@ -577,12 +594,7 @@ func (p *PubSub) seenMessage(id string) bool {
 func (p *PubSub) markSeen(id string) bool {
 	p.seenMessagesMx.Lock()
 	defer p.seenMessagesMx.Unlock()
-	if p.seenMessages.Has(id) {
-		return false
-	}
-
-	p.seenMessages.Add(id)
-	return true
+	return p.seenMessages.Add(id)
 }
 
 // subscribedToMessage returns whether we are subscribed to one of the topics

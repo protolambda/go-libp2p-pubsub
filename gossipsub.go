@@ -12,17 +12,6 @@ import (
 	"github.com/libp2p/go-libp2p-core/protocol"
 )
 
-type NanoClock interface {
-	// Current unix nano second time
-	Now() time.Duration
-}
-
-type SystemClock struct{}
-
-func (sc SystemClock) Now() time.Duration {
-	return time.Duration(time.Now().UnixNano())
-}
-
 const (
 	GossipSubID = protocol.ID("/meshsub/1.0.0")
 )
@@ -46,7 +35,7 @@ var (
 )
 
 // NewGossipSub returns a new GossipSubRouter.
-func NewGossipSub(clock NanoClock) *GossipSubRouter {
+func NewGossipSub() *GossipSubRouter {
 	return &GossipSubRouter{
 		peers:   make(map[peer.ID]protocol.ID),
 		mesh:    make(map[string]map[peer.ID]struct{}),
@@ -55,7 +44,6 @@ func NewGossipSub(clock NanoClock) *GossipSubRouter {
 		gossip:  make(map[peer.ID][]*pb.ControlIHave),
 		control: make(map[peer.ID]*pb.ControlMessage),
 		mcache:  NewMessageCache(GossipSubHistoryGossip, GossipSubHistoryLength),
-		clock:   clock,
 	}
 }
 
@@ -75,7 +63,6 @@ type GossipSubRouter struct {
 	gossip  map[peer.ID][]*pb.ControlIHave  // pending gossip
 	control map[peer.ID]*pb.ControlMessage  // pending control messages
 	mcache  *MessageCache
-	clock   NanoClock
 }
 
 func (gs *GossipSubRouter) Protocols() []protocol.ID {
@@ -250,7 +237,7 @@ func (gs *GossipSubRouter) Publish(from peer.ID, msg *pb.Message) {
 					gs.fanout[topic] = gmap
 				}
 			}
-			gs.lastpub[topic] = gs.clock.Now()
+			gs.lastpub[topic] = gs.p.clock.Now()
 		}
 
 		for p := range gmap {
@@ -457,7 +444,7 @@ func (gs *GossipSubRouter) Heartbeat() {
 	}
 
 	// expire fanout for topics we haven't published to in a while
-	now := gs.clock.Now()
+	now := gs.p.clock.Now()
 	for topic, lastpub := range gs.lastpub {
 		if lastpub+GossipSubFanoutTTL < now {
 			delete(gs.fanout, topic)
