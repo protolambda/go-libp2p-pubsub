@@ -181,6 +181,7 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		peers:         make(map[peer.ID]chan *RPC),
 		blacklist:     NewMapBlacklist(),
 		blacklistPeer: make(chan peer.ID),
+		clock:         SystemClock{},
 		// any unique enough value, time is not relevant. Can be customized with WithInitialSeqNo
 		counter:       uint64(time.Now().UnixNano()),
 	}
@@ -305,7 +306,7 @@ func (p *PubSub) processLoop() {
 			return
 		} else if free {
 			// avoid busy wait
-			time.Sleep(10 * time.Millisecond)
+			time.Sleep(time.Millisecond)
 		}
 	}
 }
@@ -335,7 +336,7 @@ func (p *PubSub) ProcessNextEvent() (free bool, exit bool) {
 		messages := make(chan *RPC, 32)
 		messages <- p.getHelloPacket()
 		p.peers[pid] = messages
-		p.handleNewPeer(p.ctx, pid, messages)
+		go p.handleNewPeer(p.ctx, pid, messages)
 	case s := <-p.newPeerStream:
 		pid := s.Conn().RemotePeer()
 
@@ -373,7 +374,7 @@ func (p *PubSub) ProcessNextEvent() (free bool, exit bool) {
 			messages := make(chan *RPC, 32)
 			messages <- p.getHelloPacket()
 			p.peers[pid] = messages
-			p.handleNewPeer(p.ctx, pid, messages)
+			go p.handleNewPeer(p.ctx, pid, messages)
 			return
 		}
 

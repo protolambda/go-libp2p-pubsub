@@ -14,10 +14,13 @@ import (
 func getGossipsubs(ctx context.Context, hs []host.Host, opts ...Option) []*PubSub {
 	var psubs []*PubSub
 	for _, h := range hs {
-		ps, err := NewGossipSub(ctx, h, opts...)
+		gs := NewGossipSub()
+		ps, err := NewPubSub(ctx, h, gs, opts...)
 		if err != nil {
 			panic(err)
 		}
+		ps.Start(true)
+		go gs.HeartbeatLoop(nil, GossipSubHeartbeatInitialDelay, GossipSubHeartbeatInterval)
 		psubs = append(psubs, ps)
 	}
 	return psubs
