@@ -8,7 +8,6 @@ import (
 
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 
-	"github.com/libp2p/go-libp2p-core/host"
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/libp2p/go-libp2p-core/protocol"
 )
@@ -46,30 +45,9 @@ var (
 	GossipSubFanoutTTL = 60 * time.Second
 )
 
-// NewGossipSub returns a new PubSub object using GossipSubRouter as the router.
-func NewGossipSub(ctx context.Context, h host.Host, opts ...Option) (*PubSub, error) {
-	rt := &GossipSubRouter{
-		peers:   make(map[peer.ID]protocol.ID),
-		mesh:    make(map[string]map[peer.ID]struct{}),
-		fanout:  make(map[string]map[peer.ID]struct{}),
-		lastpub: make(map[string]time.Duration),
-		gossip:  make(map[peer.ID][]*pb.ControlIHave),
-		control: make(map[peer.ID]*pb.ControlMessage),
-		mcache:  NewMessageCache(GossipSubHistoryGossip, GossipSubHistoryLength),
-		clock:   SystemClock{},
-		hbinit:  defaultHeartbeatInit(GossipSubHeartbeatInitialDelay, GossipSubHeartbeatInterval),
-	}
-	return NewPubSub(ctx, h, rt, opts...)
-}
-
-type HeartBeatInit func(ctx context.Context, eval chan<- func(), heartbeat func())
-
-// NewGossipSub returns a new PubSub object using GossipSubRouter as the router.
-func NewCustomGossipSub(ctx context.Context, h host.Host, clock NanoClock,
-	hbinit HeartBeatInit, opts ...Option) (*PubSub, error) {
-	// TODO: even better if we have a second set of ...Option but to fully customize gossipsub,
-	//  and stop using those globals completely.
-	rt := &GossipSubRouter{
+// NewGossipSub returns a new GossipSubRouter.
+func NewGossipSub(clock NanoClock) *GossipSubRouter {
+	return &GossipSubRouter{
 		peers:   make(map[peer.ID]protocol.ID),
 		mesh:    make(map[string]map[peer.ID]struct{}),
 		fanout:  make(map[string]map[peer.ID]struct{}),
@@ -78,9 +56,7 @@ func NewCustomGossipSub(ctx context.Context, h host.Host, clock NanoClock,
 		control: make(map[peer.ID]*pb.ControlMessage),
 		mcache:  NewMessageCache(GossipSubHistoryGossip, GossipSubHistoryLength),
 		clock:   clock,
-		hbinit:  hbinit,
 	}
-	return NewPubSub(ctx, h, rt, opts...)
 }
 
 // GossipSubRouter is a router that implements the gossipsub protocol.
@@ -100,7 +76,6 @@ type GossipSubRouter struct {
 	control map[peer.ID]*pb.ControlMessage  // pending control messages
 	mcache  *MessageCache
 	clock   NanoClock
-	hbinit  HeartBeatInit
 }
 
 func (gs *GossipSubRouter) Protocols() []protocol.ID {
@@ -109,7 +84,6 @@ func (gs *GossipSubRouter) Protocols() []protocol.ID {
 
 func (gs *GossipSubRouter) Attach(p *PubSub) {
 	gs.p = p
-	gs.hbinit(gs.p.ctx, gs.p.eval, gs.heartbeat)
 }
 
 func (gs *GossipSubRouter) AddPeer(p peer.ID, proto protocol.ID) {
@@ -401,36 +375,37 @@ func (gs *GossipSubRouter) sendRPC(p peer.ID, out *RPC) {
 	}
 }
 
-func defaultHeartbeatInit(initDelay, interval time.Duration) HeartBeatInit {
-	return func(ctx context.Context, eval chan<- func(), heartbeat func()) {
-		go func() {
-			time.Sleep(initDelay)
+// Run the heartbeat loop in sync. The context is optional, if none is provided the heartbeats stop when pubsub stops.
+// An initial delay and heartbeat can be specified to
+func (gs *GossipSubRouter) HeartbeatLoop(ctx context.Context, initDelay, interval time.Duration) {
+	if ctx == nil {
+		ctx = gs.p.ctx
+	}
+	time.Sleep(initDelay)
+	select {
+	case gs.p.eval <- gs.Heartbeat:
+	case <-ctx.Done():
+		return
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
 			select {
-			case eval <- heartbeat:
+			case gs.p.eval <- gs.Heartbeat:
 			case <-ctx.Done():
 				return
 			}
-
-			ticker := time.NewTicker(interval)
-			defer ticker.Stop()
-
-			for {
-				select {
-				case <-ticker.C:
-					select {
-					case eval <- heartbeat:
-					case <-ctx.Done():
-						return
-					}
-				case <-ctx.Done():
-					return
-				}
-			}
-		}()
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 
-func (gs *GossipSubRouter) heartbeat() {
+func (gs *GossipSubRouter) Heartbeat() {
 	defer log.EventBegin(gs.p.ctx, "heartbeat").Done()
 
 	// flush pending control message from retries and gossip

@@ -42,9 +42,6 @@ type PubSub struct {
 
 	val *validation
 
-	// if the event-loop should be started at initialization
-	runEventLoop bool
-
 	// incoming messages from other peers
 	incoming chan *RPC
 
@@ -164,7 +161,6 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		signID:        h.ID(),
 		signKey:       h.Peerstore().PrivKey(h.ID()),
 		signStrict:    true,
-		runEventLoop:  true,
 		incoming:      make(chan *RPC, 32),
 		publish:       make(chan *Message),
 		newPeers:      make(chan peer.ID),
@@ -199,20 +195,24 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		return nil, fmt.Errorf("strict signature verification enabled but message signing is disabled")
 	}
 
-	rt.Attach(ps)
+	ps.rt.Attach(ps)
 
-	for _, id := range rt.Protocols() {
-		h.SetStreamHandler(id, ps.handleNewStream)
+	return ps, nil
+}
+
+func (ps *PubSub) Start(runEventLoop bool) {
+	ps.rt.Attach(ps)
+
+	for _, id := range ps.rt.Protocols() {
+		ps.host.SetStreamHandler(id, ps.handleNewStream)
 	}
-	h.Network().Notify((*PubSubNotif)(ps))
+	ps.host.Network().Notify((*PubSubNotif)(ps))
 
 	ps.val.Start(ps)
 
-	if ps.runEventLoop {
+	if runEventLoop {
 		go ps.processLoop()
 	}
-
-	return ps, nil
 }
 
 // WithMessageSigning enables or disables message signing (enabled by default).
@@ -278,13 +278,6 @@ func (p *PubSub) Cleanup() {
 	}
 	p.peers = nil
 	p.topics = nil
-}
-
-func DisableEventLoop() Option {
-	return func(p *PubSub) error {
-		p.runEventLoop = false
-		return nil
-	}
 }
 
 func (p *PubSub) processLoop() {
