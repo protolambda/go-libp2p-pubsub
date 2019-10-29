@@ -15,13 +15,13 @@ import (
 
 type NanoClock interface {
 	// Current unix nano second time
-	Now() int64
+	Now() time.Duration
 }
 
-type SystemClock struct {}
+type SystemClock struct{}
 
-func (sc SystemClock) Now() int64 {
-	return time.Now().Unix()
+func (sc SystemClock) Now() time.Duration {
+	return time.Duration(time.Now().UnixNano())
 }
 
 const (
@@ -52,7 +52,7 @@ func NewGossipSub(ctx context.Context, h host.Host, opts ...Option) (*PubSub, er
 		peers:   make(map[peer.ID]protocol.ID),
 		mesh:    make(map[string]map[peer.ID]struct{}),
 		fanout:  make(map[string]map[peer.ID]struct{}),
-		lastpub: make(map[string]int64),
+		lastpub: make(map[string]time.Duration),
 		gossip:  make(map[peer.ID][]*pb.ControlIHave),
 		control: make(map[peer.ID]*pb.ControlMessage),
 		mcache:  NewMessageCache(GossipSubHistoryGossip, GossipSubHistoryLength),
@@ -73,7 +73,7 @@ func NewCustomGossipSub(ctx context.Context, h host.Host, clock NanoClock,
 		peers:   make(map[peer.ID]protocol.ID),
 		mesh:    make(map[string]map[peer.ID]struct{}),
 		fanout:  make(map[string]map[peer.ID]struct{}),
-		lastpub: make(map[string]int64),
+		lastpub: make(map[string]time.Duration),
 		gossip:  make(map[peer.ID][]*pb.ControlIHave),
 		control: make(map[peer.ID]*pb.ControlMessage),
 		mcache:  NewMessageCache(GossipSubHistoryGossip, GossipSubHistoryLength),
@@ -95,7 +95,7 @@ type GossipSubRouter struct {
 	peers   map[peer.ID]protocol.ID         // peer protocols
 	mesh    map[string]map[peer.ID]struct{} // topic meshes
 	fanout  map[string]map[peer.ID]struct{} // topic fanout
-	lastpub map[string]int64                // last publish time for fanout topics
+	lastpub map[string]time.Duration        // last publish time for fanout topics
 	gossip  map[peer.ID][]*pb.ControlIHave  // pending gossip
 	control map[peer.ID]*pb.ControlMessage  // pending control messages
 	mcache  *MessageCache
@@ -484,7 +484,7 @@ func (gs *GossipSubRouter) heartbeat() {
 	// expire fanout for topics we haven't published to in a while
 	now := gs.clock.Now()
 	for topic, lastpub := range gs.lastpub {
-		if lastpub+int64(GossipSubFanoutTTL) < now {
+		if lastpub+GossipSubFanoutTTL < now {
 			delete(gs.fanout, topic)
 			delete(gs.lastpub, topic)
 		}
